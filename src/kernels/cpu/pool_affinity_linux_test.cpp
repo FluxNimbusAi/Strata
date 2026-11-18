@@ -202,6 +202,46 @@ static bool round_trip_high_cpu(const std::vector<int>& allowed, bool require_hi
     return restored;
 }
 
+// PR #14 (issue #13) guard: a restricted mask must never balloon the core list.  The pre-fix dangling else ran
+// the hardware_concurrency fallback once per UNSET bit of the fixed 1024-entry mask, so k allowed CPUs produced
+// k + (1024 - k) * h entries - 16143 workers on the box that reported it.  Membership alone can miss the bug
+// when the ballooned ids happen to fall inside the mask, so the LENGTH is the invariant that catches it:
+// physical_cores() gives one entry per distinct physical core of the mask, never more than the mask has CPUs.
+static bool list_length_bounded_by_mask() {
+    std::vector<int> allowed;
+    if (!get_affinity(allowed)) return false;
+    if (allowed.size() < 2) {
+        std::puts("SKIP PR #14 list-length guard: fewer than two allowed CPUs");
+        return true;
+    }
+    const std::vector<int> mask{allowed.front(), allowed.back()};   // ascending, maybe sparse
+    if (!set_affinity(mask) || !expect_affinity(mask, "establish length-guard mask")) return false;
+    const std::vector<int> list = cpu::physical_cores(false);
+    bool ok = true;
+    if (list.empty() || list.size() > mask.size()) {
+        std::fprintf(stderr, "Linux affinity test: PR #14 guard: a mask of %zu CPUs projected %zu entries "
+                             "(the pre-fix list was k + (1024 - k) * h)\n", mask.size(), list.size());
+        ok = false;
+    }
+    std::vector<int> sorted = list;
+    std::sort(sorted.begin(), sorted.end());
+    if (std::adjacent_find(sorted.begin(), sorted.end()) != sorted.end()) {
+        std::fprintf(stderr, "Linux affinity test: PR #14 guard: the core list carries duplicates\n");
+        ok = false;
+    }
+    for (int core : list)
+        if (!std::binary_search(mask.begin(), mask.end(), core)) {
+            std::fprintf(stderr, "Linux affinity test: PR #14 guard: CPU %d outside the restricted mask\n", core);
+            ok = false;
+            break;
+        }
+    const bool restored = set_affinity(allowed) && expect_affinity(allowed, "restore full mask after length guard");
+    if (ok && restored)
+        std::printf("PR #14 length guard: a 2-CPU mask projects %zu core(s), bounded and duplicate-free\n",
+                    list.size());
+    return ok && restored;
+}
+
 static bool negative_cpu_is_noop() {
     std::vector<int> before;
     if (!get_affinity(before)) return false;
@@ -270,6 +310,7 @@ int main(int argc, char** argv) {
     bool ok = round_trip_full_mask(allowed) && worker_thread_can_pin(allowed.back());
     if (ok) ok = round_trip_sparse_nested(allowed);
     if (ok) ok = round_trip_high_cpu(allowed, require_high);
+    if (ok) ok = list_length_bounded_by_mask();
     if (ok) ok = negative_cpu_is_noop();
     if (ok) ok = failed_pin_preserves_affinity();
     const bool restored = original.restore() && expect_affinity(allowed, "final original affinity cleanup");
