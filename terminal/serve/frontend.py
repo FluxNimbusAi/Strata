@@ -906,6 +906,11 @@ _QUOTED_OPEN = re.compile(r"<function=[^<>\s]+>\s*(?:<parameter=|</function>)")
 CLOSE_LOOKAHEAD_CHARS = 1500
 
 
+# #5756 nested detection: a proper parameter-element opener (closed, clean name token); damaged or
+# unterminated forms inside a value are text, not openers (the #210 golden floor).
+_NESTED_OPENER = re.compile(r"<parameter=([^\s<>]+)\s*>")
+
+
 def _close_verdict(after: str, final: bool) -> str:
     """`after` starts with `</function>` and/or `</tool_call>` right after a `</parameter>`.  A file that documents the call format has those
     three tags on lines of its own inside a value (#4701), so the sequence only ends the value when what follows is the end of the turn, another
@@ -1000,8 +1005,11 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     nested = False               # #5756: a close in this value matched a nested opener
     resume = -1                  # where the value goes on from: just past the last close that is value text
     while at >= 0:
-        if skipped and text.count(PARAM_START, 0, at) > text.count(PARAM_END, 0, at):
-            nested = True        # this close matches a nested opener above it: value text (#5756)
+        if skipped and (names is None or names) and len(_NESTED_OPENER.findall(text, 0, at)) > text.count(PARAM_END, 0, at):
+            nested = True        # this close matches a proper nested opener above it: value text (#5756).  A schema
+                                 # walk with no declared follower left (names an empty set) keeps the old rule: a close
+                                 # followed by FUNC_END is then the value's own (#210) - the repair stays on the routes
+                                 # that pin it: no schema (names None) or a declared follower not set yet
             probe = boundary(at + close_len(text, at, closer), nxt(at + 1))
             if probe != -1:
                 return probe     # a boundary (or a streaming hold) arrives before the next close: it ends the value
