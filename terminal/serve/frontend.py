@@ -937,7 +937,7 @@ def _close_verdict(after: str, final: bool) -> str:
 
 def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
               allow_reopen: bool = False, names=None, closer: str | None = None,
-              skipped: bool = True) -> int:
+              skipped: bool = True, declared=None) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
@@ -952,6 +952,8 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
     so the fallbacks cannot double-fire), or an opener of a declared parameter the call has not set yet (opener_at).
     `skipped` off - a call the reasoning quotes - keeps the whole old rule.
     -1: none yet; -2: a candidate whose follower has not arrived (streaming; `final` accepts it)."""
+    if declared is not None:   #5756 acceptance matrix names the declared set `declared`; the fold maps
+        names = declared       #it onto the existing names/closer machinery (opener_at) - no second rule
     def nxt(start):
         a = text.find(PARAM_END, start)
         b = text.find(closer, start) if closer else -1
