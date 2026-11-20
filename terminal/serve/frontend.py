@@ -935,8 +935,47 @@ def _close_verdict(after: str, final: bool) -> str:
 
 
 
+def _skipped_closer_end(text: str, resume: int, final: bool, name: str | None, declared, before: int = -1) -> int:
+    """#5756: every </parameter> in the value closed a nested <parameter=, so the model skipped the value's own closer.  The
+    value ends right before the first boundary after the last close that is value text: the call's </function> (not one
+    inside a call the value quotes - the #4078 guard), the wrapper's </tool_call> when the openers and the closers before it
+    are even (the call's </function> skipped too, #4427), or a <parameter= whose name `declared` lists and `name` is not.  A
+    boundary is not a closer: the caller consumes nothing at it.  -1: the value still goes on; -2: a boundary tag is
+    still arriving at the window edge (streaming: hold from the first close, so nothing shows twice)."""
+    at = resume
+    while True:
+        f = text.find(FUNC_END, at)
+        p = text.find(PARAM_START, at)
+        c = text.find(CALL_END, at)
+        cands = [i for i in (f, p, c) if i >= 0]
+        if not cands:
+            break
+        nxt = min(cands)
+        if 0 <= before <= nxt:            # a later close claims the value first: the scan defers to it
+            return -1
+        if nxt == f:                                   # the earliest boundary is a </function>: the call's closer ends the value
+            if len(_QUOTED_OPEN.findall(text, 0, f)) <= text.count(FUNC_END, 0, f):
+                return f
+            at = f + len(FUNC_END)                     # it closes a quoted call: the value goes on
+        elif nxt == p:                                 # an opener ends the value only when the tool declares that name
+            gt = text.find(">", p + len(PARAM_START))
+            if gt < 0:
+                break                                  # the opener is still arriving
+            if declared is not None and text[p + len(PARAM_START):gt].strip() != name and text[p + len(PARAM_START):gt].strip() in declared:
+                return p
+            at = gt + 1                                # a nested opener inside the value: the value goes on
+        else:                                          # a bare </tool_call>: the model left out </function> as well (#4427 shape)
+            if text.count(CALL_START, 0, c) == text.count(CALL_END, 0, c):
+                return c
+            at = c + len(CALL_END)                     # it closes a quoted wrapper: the value goes on
+    if not final:
+        return -2      # streaming: hold from the first close - the boundary that ends the value has not fully arrived
+    return -1
+
+
 def param_end(text: str, final: bool = False, name: str | None = None, hold: bool = True,
-              allow_reopen: bool = False, names=None, closer: str | None = None) -> int:
+              allow_reopen: bool = False, names=None, closer: str | None = None,
+              declared=None, skipped: bool = True) -> int:
     """Where a parameter value in `text` ends: the first PARAM_END followed (after whitespace) by the next
     PARAM_START or FUNC_END, or by the wrapper's CALL_END when the call's `</function>` was left out (#4427) - the
     same text inside a value (a file that documents the call format, #210) is
@@ -950,8 +989,16 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
         b = text.find(closer, start) if closer else -1
         return a if b < 0 or 0 <= a < b else b
     at = nxt(0)
+    nested = False
+    resume = -1
     while at >= 0:
-        if len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
+        if skipped and text.count(PARAM_START, 0, at) > text.count(PARAM_END, 0, at):
+            nested = True
+            probe = _skipped_closer_end(text, at + len(PARAM_END), final, name, declared,
+                                        text.find(PARAM_END, at + 1))
+            if probe != -1:
+                return probe
+        elif len(_QUOTED_OPEN.findall(text, 0, at)) <= text.count(FUNC_END, 0, at):
             after = text[at + close_len(text, at, closer):].lstrip()
             if after.startswith(PARAM_START):
                 gt = after.find(">")
@@ -976,7 +1023,10 @@ def param_end(text: str, final: bool = False, name: str | None = None, hold: boo
                     or (names and opener_at(after, names, final) == "pending") \
                     or (names is not None and _stub_follows(after) is None):
                 return at if final else -2
+        resume = at + close_len(text, at, closer)
         at = nxt(at + 1)
+    if skipped and nested:
+        return _skipped_closer_end(text, resume, final, name, declared)
     return -1
 
 
@@ -1158,11 +1208,11 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
                 return -1
             pname = param_name(text[pos:gt].split("=", 1)[1])
             end = param_end(text[gt + 1:], final, pname, hold, allow_reopen=True,
-                            names=(set(names) - seen - {pname}) if names else None)
+                            declared=(set(names) - seen - {pname}) if names else None, names=(set(names) - seen - {pname}) if names else None)
             if end < 0:
                 return -1
             seen.add(pname)
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + (len(PARAM_END) if text.startswith(PARAM_END, gt + 1 + end) else 0)
         elif got is not None:                                 # #6032 R2 / R4 / R5: any opener, an element too
             pname, length, _ = got
             closer = "</%s>" % pname if pname and s.startswith("<%s>" % pname) else None
@@ -1171,7 +1221,7 @@ def call_end(text: str, final: bool = False, hold: bool = True, names=None) -> i
             if end < 0:
                 return -1
             seen.add(pname)
-            pos = pos + length + end + close_len(text[pos + length:], end, closer)
+            pos = pos + length + end + (close_len(text[pos + length:], end, closer) if not text[pos + length:].startswith((PARAM_START, FUNC_END, CALL_END), end) else 0)
         elif s.startswith(FUNC_END):
             rest = text[pos + len(FUNC_END):]
             s = rest.lstrip()
@@ -1258,7 +1308,7 @@ def function_end(text: str) -> int:
             end = param_end(text[gt + 1:], name=param_name(text[pos:gt].split("=", 1)[1]), hold=False, allow_reopen=True)   # a bare or unwrapped call: the old rule
             if end < 0:
                 return -1
-            pos = gt + 1 + end + len(PARAM_END)
+            pos = gt + 1 + end + (len(PARAM_END) if text.startswith(PARAM_END, gt + 1 + end) else 0)
         elif s.startswith(FUNC_END):
             return pos + len(FUNC_END)
         else:
@@ -1574,9 +1624,9 @@ def parse_tool_call(body: str, schema: dict | None = None, notes: list | None = 
             # #5493: a close followed by the same name again is part of a STRING value (#4078); a non-string parameter
             # written twice is two writes of it, and the later one counts
             end = param_end(rest, final=True, name=pname, allow_reopen=(declared is None or _declares(declared, "string")),
-                            names={n for n in props if n not in args and n != pname} if recover else None, closer=closer)
+                            declared={n for n in props if n not in args and n != pname}, names={n for n in props if n not in args and n != pname} if recover else None, closer=closer)
             value = rest[:end] if end >= 0 else rest
-            rest = rest[end + close_len(rest, end, closer):] if end >= 0 else ""
+            rest = rest[end + (0 if rest.startswith((PARAM_START, FUNC_END, CALL_END), end) else close_len(rest, end, closer)):] if end >= 0 else ""
             if value.startswith("\n"):
                 value = value[1:]
             if value.endswith("\n"):
@@ -2094,7 +2144,7 @@ class OutputParser:
                 # the walk starts at the value (a quoted call's opener counts); only a close in the new text can end it
                 closers = (PARAM_END, self.scloser) if self.scloser else (PARAM_END,)
                 end = param_end(self.buf[self.svstart:], self._final, name=self.spname, allow_reopen=True,
-                                names=self.snames, closer=self.scloser) if any(c in rest for c in closers) else -1
+                                names=self.snames, declared=(set(self.sdeclared) - self.sset - {self.spname}) or None, closer=self.scloser) if any(c in rest for c in closers) else -1
                 end = end - (self.sp - self.svstart) if end >= 0 else end
                 if end >= 0:
                     value = rest[:end]
